@@ -6,9 +6,11 @@ set -o pipefail
 
 CAASCAD_ZONES_URL=${CAASCAD_ZONES_URL:-https://git.corp.cloudwatt.com/caascad/caascad-zones/raw/master/zones.json}
 CONFIG_DIR="$HOME/.config/kswitch"
-CAASCAD_ZONES_FILE="$CONFIG_DIR/zones.json"
+CACHE_DIR="${CONFIG_DIR}/cache"
+CAASCAD_ZONES_FILE="${CACHE_DIR}/zones.json"
 KSWITCH_DEBUG=${KSWITCH_DEBUG:-0}
 KSWITCH_TRACE=${KSWITCH_TRACE:-0}
+CACHE_TIMEOUT=${CACHE_TIMEOUT:-10}
 
 if [ $KSWITCH_TRACE -eq 1 ]; then set -x; fi
 
@@ -47,6 +49,29 @@ _continue() {
   [[ $REPLY =~ ^[Yy]$ ]] || exit 1
 }
 
+wait_lock() {
+    local lock
+    lock="${lockPath}/$*"
+    log_debug "Waiting for lock: ${lock}"
+    while ! mkdir "${lock}" 2>/dev/null; do :;done
+    log_debug "Lock acquired: ${lock}"
+}
+
+lock() {
+    local lock
+    lock="${lockPath}/$*"
+    log_debug "Trying to acquire lock: ${lock}"
+    mkdir "${lock}" 2>/dev/null && log_debug "Lock acquired: ${lock}" && return 0
+    log_debug "Lock unavailable: ${lock}" && return 1
+}
+
+unlock() {
+    local lock
+    lock="${lockPath}/$*"
+    rm -r "${lock}" 2>/dev/null && log_debug "Lock released: ${lock}" && return 0
+    log_debug "Cannot release lock: ${lock}" && return 1
+}
+
 bash_completions() {
   cat <<EOF
 _kswitch_completions() {
@@ -64,12 +89,14 @@ EOF
 usage() {
   cat <<EOF
 Usage:
-  kswitch ZONE_NAME     Start tunnel to ZONE_NAME and change kubectl context
-  kswitch [--json]      Show kswitch status
-  kswitch -k, --kill    Stop any active tunnel
-  kswitch -h, --help    This help
-  kswitch --no-input    Don't ask for user inputs
-  kswitch -v, --version Current kswitch version
+  kswitch ZONE_NAME        Start tunnel to ZONE_NAME and change kubectl context
+  kswitch [--json]         Show kswitch status
+  kswitch -k, --kill       Stop any active tunnel
+  kswitch -h, --help       This help
+  kswitch --no-input       Don't ask for user inputs
+  kswitch --force-refresh  Ignore cached results
+  kswitch --force-unlock   Remove all remaining locks & clean cache
+  kswitch -v, --version    Current kswitch version
 
 kswitch automatically setup an SSH tunnel to the specified zone K8S cluster.
 
@@ -106,12 +133,21 @@ setup() {
     _continue
     mkdir -p "$CONFIG_DIR"
   fi
+  mkdir -p "${CACHE_DIR}"
+  mkdir -p "${lockPath}"
 
-  hasTunnel=$(kubectl config view -o=json | jq 'if .clusters then .clusters else {} end | map(select(.name == "tunnel")) | length')
+  hasTunnel=$(kubectl config view -o=json | jq '(.clusters // {}) | map(select(.name == "tunnel")) | length')
   if [ ! "$hasTunnel" == "1" ]; then
     log "I'm going to add a cluster named tunnel to the local kube configuration:"
     run_c "kubectl config set-cluster tunnel --server https://localhost:${localPort} --insecure-skip-tls-verify=true"
   fi
+}
+
+force_unlock() {
+  log "Cleaning Locks & Cache directories: (lock:${lockPath} / cache:${CACHE_DIR})"
+  _continue
+  rm -rf "${CACHE_DIR}" "${lockPath}"
+  exit 0
 }
 
 kill_tunnel() {
@@ -181,6 +217,42 @@ get_aws_credentials() {
         jq -r '.data | "export AWS_ACCESS_KEY_ID=\(.access_key); export AWS_SECRET_ACCESS_KEY=\(.secret_key); export AWS_SESSION_TOKEN=\(.security_token)"' > "${awsCredsFilePath}"
 }
 
+check_cache_timeout(){
+    # Check whether CACHE_TIMEOUT is an integer
+    [ "${CACHE_TIMEOUT}" -eq "${CACHE_TIMEOUT}" ] 2>/dev/null && return
+    log-error "CACHE_TIMEOUT has to be an integer !" && exit 1
+}
+
+get_credentials_or_cache() {
+    local toRefresh
+    toRefresh=${forceRefresh}
+    while true; do
+        if [ -f "${cachedExecCredentialsPath}" ] && [ "${toRefresh}" -eq 0 ]; then
+            local cachedResponse
+            cachedResponse="$(cat "${cachedExecCredentialsPath}")"
+            local cacheTimeout
+            cacheTimeout="$(jq -r '.cacheTimeout' <<<"${cachedResponse}")"
+            local cacheTimeoutEpoch
+            cacheTimeoutEpoch="$(date --date="${cacheTimeout}" +"%s")"
+            local nowEpoch
+            nowEpoch="$(date +"%s")"
+            if [ "${nowEpoch}"  -lt "${cacheTimeoutEpoch}" ]; then
+                log_debug "Fetching credentials from cache"
+                jq -r '.execCredential' <<<"${cachedResponse}"
+                return
+            fi
+        fi
+        local lockName
+        lockName="credentials_${zone}_lock"
+        lock "${lockName}" || continue
+        defaultCacheTimeout="$(date --date="+${CACHE_TIMEOUT} minutes" --iso-8601=seconds)"
+        get_credentials | jq -r --arg defaultCacheTimeout "${defaultCacheTimeout}" '{"cacheTimeout": (.status.expirationTimestamp // $defaultCacheTimeout), "execCredential": . }' > "${cachedExecCredentialsPath}.tmp"
+        mv "${cachedExecCredentialsPath}.tmp" "${cachedExecCredentialsPath}"
+        toRefresh=0
+        unlock "${lockName}"
+    done
+}
+
 get_credentials() {
     vault_login
     if [ "$zoneType" == "fe" ]; then
@@ -205,9 +277,33 @@ get_credentials() {
     exit 0
 }
 
+refresh_zones_or_cache() {
+    while true; do
+        if [ -f "${CAASCAD_ZONES_FILE}" ] && [ "${forceRefresh}" -eq 0 ]; then
+            local lastUpdate
+            lastUpdate="$(date --iso-8601=seconds -r "${CAASCAD_ZONES_FILE}")"
+            local cacheTimeoutEpoch
+            cacheTimeoutEpoch="$(date --date="${lastUpdate} +${CACHE_TIMEOUT} minutes" +"%s")"
+            local nowEpoch
+            nowEpoch="$(date +"%s")"
+            if [ "${nowEpoch}"  -lt "${cacheTimeoutEpoch}" ]; then
+                log_debug "Not refreshing caascad-zones: cache is still valid"
+                return
+            fi
+        fi
+        local lockName
+        lockName="caascad_zones_lock"
+        lock "${lockName}" || continue
+        refresh_zones
+        unlock "${lockName}"
+        return
+    done
+}
+
 refresh_zones() {
     log_debug "Refreshing caascad-zones..."
-    curl --connect-timeout 2 -s -o "${CAASCAD_ZONES_FILE}" "${CAASCAD_ZONES_URL}"
+    curl --connect-timeout 2 -s -o "${CAASCAD_ZONES_FILE}.tmp" "${CAASCAD_ZONES_URL}"
+    mv "${CAASCAD_ZONES_FILE}.tmp" "${CAASCAD_ZONES_FILE}"
 }
 
 zone_exists() {
@@ -265,8 +361,11 @@ jsonOutput=0
 localPort=30000
 socketPath="/dev/shm/kswitch"
 [ ! -d /dev/shm ] && socketPath="/tmp/kswitch"
+{ [ -d /dev/shm ] && lockPath="/dev/shm"; } || lockPath="/tmp"
+lockPath="${lockPath}/kswitch.d"
 zone=""
 execCredentialMode=0
+forceRefresh=0
 disableInput=0
 
 while (( "$#" )); do
@@ -289,6 +388,15 @@ while (( "$#" )); do
         ;;
         --json)
         jsonOutput=1
+        shift
+        ;;
+        --force-refresh)
+        forceRefresh=1
+        shift
+        ;;
+        --force-unlock)
+          force_unlock
+          exit 0
         shift
         ;;
         -c)
@@ -318,13 +426,15 @@ unset KUBECONFIG
 [ "$zone" == "" ] && status
 
 setup
-refresh_zones
+check_cache_timeout
+refresh_zones_or_cache
 
 if zone_exists "${zone}"; then
     log_debug "Found caascad zone ${zone}"
     infraZone=$(zone_attr $zone "infra_zone_name")
     domainName=$(zone_attr $infraZone "domain_name")
     zoneType=$(zone_attr $zone "provider.type")
+    cachedExecCredentialsPath="${CACHE_DIR}/${zone}_kubectl_exec_credential"
     log_debug "Zone is on provider ${zoneType}"
 
     if [ "$zoneType" == "aws" ]; then
@@ -336,7 +446,7 @@ if zone_exists "${zone}"; then
     VAULT_ADDR="https://vault.${infraZone}.${domainName}"
     export VAULT_ADDR
 
-    [ $execCredentialMode -eq 1 ] && get_credentials
+    [ $execCredentialMode -eq 1 ] && get_credentials_or_cache && exit 0
 
     kill_tunnel
     configure_kubeconfig
