@@ -1,0 +1,25 @@
+From 32c2baca874d4394de2ed69be1c2a6bee3a2ac7c Mon Sep 17 00:00:00 2001
+From: Xavier Maillard <xavier.maillard@orange.com>
+Date: Tue, 15 Jun 2021 14:26:10 +0200
+Subject: [PATCH] fix: long int instead of unsigned int
+
+---
+ src/flock.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/flock.c b/src/flock.c
+index 8f1f0de..2b0c9d2 100644
+--- a/src/flock.c
++++ b/src/flock.c
+@@ -320,7 +320,7 @@ int main(int argc, char *argv[]) {
+ 	}
+ 	if (verbose) {
+ 		gettimeofday(&t_l_acq,NULL);
+-		printf("took %1u microseconds\n", (t_l_acq.tv_usec - t_l_req.tv_usec)); // not adding due to time constraints
++		printf("took %1ld microseconds\n", (t_l_acq.tv_usec - t_l_req.tv_usec)); // not adding due to time constraints
+ 	}
+ 
+ 	if (have_timeout) {
+-- 
+2.32.0
+

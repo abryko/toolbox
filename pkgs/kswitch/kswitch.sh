@@ -8,9 +8,10 @@ CAASCAD_ZONES_URL=${CAASCAD_ZONES_URL:-https://git.corp.cloudwatt.com/caascad/ca
 CONFIG_DIR="$HOME/.config/kswitch"
 CACHE_DIR="${CONFIG_DIR}/cache"
 CAASCAD_ZONES_FILE="${CACHE_DIR}/zones.json"
-KSWITCH_DEBUG=${KSWITCH_DEBUG:-0}
-KSWITCH_TRACE=${KSWITCH_TRACE:-0}
-CACHE_TIMEOUT=${CACHE_TIMEOUT:-10}
+KSWITCH_DEBUG="${KSWITCH_DEBUG:-0}"
+KSWITCH_TRACE="${KSWITCH_TRACE:-0}"
+CACHE_TIMEOUT="${CACHE_TIMEOUT:-10}"
+VAULT_CLIENT_TIMEOUT="${VAULT_CLIENT_TIMEOUT:-2}"
 
 if [ $KSWITCH_TRACE -eq 1 ]; then set -x; fi
 
@@ -49,29 +50,6 @@ _continue() {
   [[ $REPLY =~ ^[Yy]$ ]] || exit 1
 }
 
-wait_lock() {
-    local lock
-    lock="${lockPath}/$*"
-    log_debug "Waiting for lock: ${lock}"
-    while ! mkdir "${lock}" 2>/dev/null; do :;done
-    log_debug "Lock acquired: ${lock}"
-}
-
-lock() {
-    local lock
-    lock="${lockPath}/$*"
-    log_debug "Trying to acquire lock: ${lock}"
-    mkdir "${lock}" 2>/dev/null && log_debug "Lock acquired: ${lock}" && return 0
-    log_debug "Lock unavailable: ${lock}" && return 1
-}
-
-unlock() {
-    local lock
-    lock="${lockPath}/$*"
-    rm -r "${lock}" 2>/dev/null && log_debug "Lock released: ${lock}" && return 0
-    log_debug "Cannot release lock: ${lock}" && return 1
-}
-
 bash_completions() {
   cat <<EOF
 _kswitch_completions() {
@@ -89,14 +67,15 @@ EOF
 usage() {
   cat <<EOF
 Usage:
-  kswitch ZONE_NAME        Start tunnel to ZONE_NAME and change kubectl context
-  kswitch [--json]         Show kswitch status
-  kswitch -k, --kill       Stop any active tunnel
-  kswitch -h, --help       This help
-  kswitch --no-input       Don't ask for user inputs
-  kswitch --force-refresh  Ignore cached results
-  kswitch --force-unlock   Remove all remaining locks & clean cache
-  kswitch -v, --version    Current kswitch version
+  kswitch ZONE_NAME          Start tunnel to ZONE_NAME and change kubectl context
+  kswitch [--json]           Show kswitch status
+  kswitch [--no-input]       Don't ask for user inputs
+  kswitch [--force-refresh]  Force cache refresh
+  kswitch -k, --kill         Stop any active tunnel
+  kswitch -h, --help         This help
+  kswitch --clean-cache      Remove cached files
+  kswitch --force-unlock     Remove all lock files
+  kswitch -v, --version      Current kswitch version
 
 kswitch automatically setup an SSH tunnel to the specified zone K8S cluster.
 
@@ -134,7 +113,6 @@ setup() {
     mkdir -p "$CONFIG_DIR"
   fi
   mkdir -p "${CACHE_DIR}"
-  mkdir -p "${lockPath}"
 
   hasTunnel=$(kubectl config view -o=json | jq '(.clusters // {}) | map(select(.name == "tunnel")) | length')
   if [ ! "$hasTunnel" == "1" ]; then
@@ -143,11 +121,16 @@ setup() {
   fi
 }
 
+clean_cache() {
+  log "Cleaning cache:"
+  [ -d "${CACHE_DIR}" ] && run_c "rm -rf ${CACHE_DIR}" || log "Cache cleaned"
+}
+
 force_unlock() {
-  log "Cleaning Locks & Cache directories: (lock:${lockPath} / cache:${CACHE_DIR})"
-  _continue
-  rm -rf "${CACHE_DIR}" "${lockPath}"
-  exit 0
+  log "Cleaning Locks:"
+  local locks
+  [ -d "${CACHE_DIR}" ] && locks=$(find ${CACHE_DIR} -name '*.lock' -exec echo {} +) || locks=""
+  [ -n "${locks}" ] && run_c "rm $locks" || log "All locks cleaned"
 }
 
 kill_tunnel() {
@@ -158,7 +141,7 @@ kill_tunnel() {
 }
 
 vault_login() {
-    vault token lookup >/dev/null 2>&1 || vault login -method oidc
+    vault token lookup >/dev/null 2>&1 || vault login -method oidc || { log-error "Vault is unreachable" && return 1; }
 }
 
 configure_kubeconfig() {
@@ -223,38 +206,77 @@ check_cache_timeout(){
     log-error "CACHE_TIMEOUT has to be an integer !" && exit 1
 }
 
-get_credentials_or_cache() {
+
+get_credentials_or_cache_wrapper(){
+    writeCredentialsLock="${cachedExecCredentialsPath}.write.lock"
+    readCredentialsLock="${cachedExecCredentialsPath}.read.lock"
+    exec {fdCredentialsWrite}>"${writeCredentialsLock}" || { log-error "Cannot get FD for lock ${writeCredentialsLock}"; exit 1; }
+    exec {fdCredentialsRead}>"${readCredentialsLock}" || { log-error "Cannot get FD for lock ${readCredentialsLock}"; exit 1; }
+    _get_credentials_or_cache
+    exec {fdCredentialsWrite}>&-
+    exec {fdCredentialsRead}>&-
+}
+
+_check_cached_credentials(){
+    local cachedResponse
+    local cacheTimeout
+    local cacheTimeoutEpoch
+    local nowEpoch
+    cachedResponse="$(cat "${cachedExecCredentialsPath}" 2>/dev/null)" || return 1
+    cachedResponse="${cachedResponse:-"{}"}"
+    cacheTimeout="$(jq -e -r '.cacheTimeout' <<<"${cachedResponse}")" || return 1
+    cacheTimeoutEpoch="$(date --date="${cacheTimeout}" +"%s")" ||  return 1
+    nowEpoch="$(date +"%s")"
+    if [ "${nowEpoch}"  -lt "${cacheTimeoutEpoch}" ]; then
+        jq -e -r '.execCredential' <<<"${cachedResponse}"
+        return 0
+    fi
+    return 1
+}
+
+_get_credentials_or_cache() {
     local toRefresh
-    toRefresh=${forceRefresh}
+    toRefresh="${forceRefresh}"
     while true; do
-        if [ -f "${cachedExecCredentialsPath}" ] && [ "${toRefresh}" -eq 0 ]; then
-            local cachedResponse
-            cachedResponse="$(cat "${cachedExecCredentialsPath}")"
-            local cacheTimeout
-            cacheTimeout="$(jq -r '.cacheTimeout' <<<"${cachedResponse}")"
-            local cacheTimeoutEpoch
-            cacheTimeoutEpoch="$(date --date="${cacheTimeout}" +"%s")"
-            local nowEpoch
-            nowEpoch="$(date +"%s")"
-            if [ "${nowEpoch}"  -lt "${cacheTimeoutEpoch}" ]; then
-                log_debug "Fetching credentials from cache"
-                jq -r '.execCredential' <<<"${cachedResponse}"
-                return
-            fi
+        if [ "${toRefresh}" -eq 0 ]; then
+            # READ FROM CACHE
+            flock -x "${fdCredentialsWrite}"
+            # Check nobody is wanting to write
+            [ -n "$(cat "${writeCredentialsLock}")" ] && flock -u "${fdCredentialsWrite}" && continue
+            flock -s "${fdCredentialsRead}"
+            flock -u "${fdCredentialsWrite}"
+            local cachedCredentials
+            cachedCredentials=$(_check_cached_credentials) && log_debug "Fetching credentials from cache" && echo "${cachedCredentials}" && flock -u "${fdCredentialsRead}" && return
+            flock -u "${fdCredentialsRead}"
         fi
-        local lockName
-        lockName="credentials_${zone}_lock"
-        lock "${lockName}" || continue
+
+        # WRITE TO CACHE
+        flock -x "${fdCredentialsWrite}"
+        # Check nobody is already wanting to write
+        [ -n "$(cat "${writeCredentialsLock}")" ] && flock -u "${fdCredentialsWrite}" && continue
+        # Verifying if cached credentials are invalid
+        [ "${toRefresh}" -eq 0 ] && _check_cached_credentials && flock -u "${fdCredentialsWrite}" && continue
+        # Applying for writing
+        echo "1" >"${writeCredentialsLock}" && flock -u "${fdCredentialsWrite}"
+        # Waiting for current readers to finish
+        flock -x "${fdCredentialsRead}"
+        # Writing new cached credentials
         defaultCacheTimeout="$(date --date="+${CACHE_TIMEOUT} minutes" --iso-8601=seconds)"
-        get_credentials | jq -r --arg defaultCacheTimeout "${defaultCacheTimeout}" '{"cacheTimeout": (.status.expirationTimestamp // $defaultCacheTimeout), "execCredential": . }' > "${cachedExecCredentialsPath}.tmp"
-        mv "${cachedExecCredentialsPath}.tmp" "${cachedExecCredentialsPath}"
+        log_debug "Updating cached credentials"
+        get_credentials | jq -e -r --arg defaultCacheTimeout "${defaultCacheTimeout}" '{"cacheTimeout": (.status.expirationTimestamp // $defaultCacheTimeout), "execCredential": . }' > "${cachedExecCredentialsPath}"
+        exit_code="$?"
+        # Finished writing, updating writer waiting
+        flock -x "${fdCredentialsWrite}"
+        cat /dev/null >"${writeCredentialsLock}"
+        # Releasing locks
+        flock -u "${fdCredentialsWrite}" && flock -u "${fdCredentialsRead}"
+        [ "${exit_code}" -ne 0 ] && log-error "Cannot refresh credentials" && exit 1
         toRefresh=0
-        unlock "${lockName}"
     done
 }
 
 get_credentials() {
-    vault_login
+    vault_login || return 1
     if [ "$zoneType" == "fe" ]; then
         log_debug "Get FE k8s certificates..."
         vault read "secret/zones/fe/${zone}/kubeconfig" | \
@@ -277,37 +299,73 @@ get_credentials() {
     exit 0
 }
 
-refresh_zones_or_cache() {
+refresh_zones_or_cache_wrapper(){
+    writeZonesLock="${CAASCAD_ZONES_FILE}.write.lock"
+    readZonesLock="${CAASCAD_ZONES_FILE}.read.lock"
+    exec {fdZonesWrite}>"${writeZonesLock}" || { log-error "Cannot get FD for lock ${writeZonesLock}"; exit 1; }
+    exec {fdZonesRead}>"${readZonesLock}" || { log-error "Cannot get FD for lock ${readZonesLock}"; exit 1; }
+    _refresh_zones_or_cache
+    exec {fdZonesWrite}>&-
+    exec {fdZonesRead}>&-
+}
+
+_check_refresh_zones(){
+    local lastUpdate
+    local cacheTimeoutEpoch
+    local nowEpoch
+    lastUpdate="$(date --iso-8601=seconds -r "${CAASCAD_ZONES_FILE}" 2>/dev/null)" || return 1
+    cacheTimeoutEpoch="$(date --date="${lastUpdate} +${CACHE_TIMEOUT} minutes" +"%s")" || return 1
+    nowEpoch="$(date +"%s")"
+    if [ "${nowEpoch}"  -lt "${cacheTimeoutEpoch}" ]; then
+        return 0
+    fi
+    return 1
+}
+
+_refresh_zones_or_cache() {
     while true; do
-        if [ -f "${CAASCAD_ZONES_FILE}" ] && [ "${forceRefresh}" -eq 0 ]; then
-            local lastUpdate
-            lastUpdate="$(date --iso-8601=seconds -r "${CAASCAD_ZONES_FILE}")"
-            local cacheTimeoutEpoch
-            cacheTimeoutEpoch="$(date --date="${lastUpdate} +${CACHE_TIMEOUT} minutes" +"%s")"
-            local nowEpoch
-            nowEpoch="$(date +"%s")"
-            if [ "${nowEpoch}"  -lt "${cacheTimeoutEpoch}" ]; then
-                log_debug "Not refreshing caascad-zones: cache is still valid"
-                return
-            fi
+        if [ "${forceRefresh}" -eq 0 ]; then
+            # READ FROM CACHE
+            flock -x "${fdZonesWrite}"
+            # Check nobody is wanting to write
+            [ -n "$(cat "${writeZonesLock}")" ] && flock -u "${fdZonesWrite}" && continue
+            flock -s "${fdZonesRead}"
+            flock -u "${fdZonesWrite}"
+            _check_refresh_zones && log_debug "Not refreshing caascad-zones: cache is still valid" && flock -u "${fdZonesRead}" && return
+            flock -u "${fdZonesRead}"
         fi
-        local lockName
-        lockName="caascad_zones_lock"
-        lock "${lockName}" || continue
-        refresh_zones
-        unlock "${lockName}"
+
+        # WRITE TO CACHE
+        flock -x "${fdZonesWrite}"
+        # Check nobody is already wanting to write
+        [ -n "$(cat "${writeZonesLock}")" ] && flock -u "${fdZonesWrite}" && continue
+        # Verifying if cached credentials are invalid
+        [ "${forceRefresh}" -eq 0 ] && _check_refresh_zones && flock -u "${fdZonesWrite}" && continue
+        # Applying for writing
+        echo "1" >"${writeZonesLock}" && flock -u "${fdZonesWrite}"
+        # Waiting for current readers to finish
+        flock -x "${fdZonesRead}"
+        # Writing new cached credentials
+        refresh_zones || { [ -f "${CAASCAD_ZONES_FILE}" ] && log "Refreshing caascad-zones cache with old data"  && touch "${CAASCAD_ZONES_FILE}"; }
+        # Finished writing, updating writer waiting
+        flock -x "${fdZonesWrite}"
+        cat /dev/null >"${writeZonesLock}"
+        # Releasing locks
+        flock -u "${fdZonesWrite}" && flock -u "${fdZonesRead}"
         return
     done
+
 }
 
 refresh_zones() {
     log_debug "Refreshing caascad-zones..."
-    curl --connect-timeout 2 -s -o "${CAASCAD_ZONES_FILE}.tmp" "${CAASCAD_ZONES_URL}"
-    mv "${CAASCAD_ZONES_FILE}.tmp" "${CAASCAD_ZONES_FILE}"
+    local httpCode
+    httpCode="$(curl -w "%{response_code}" --connect-timeout 2 -s -o "${CAASCAD_ZONES_FILE}" "${CAASCAD_ZONES_URL}")" || { [ "${httpCode}" != "200" ] && log-error "Refreshing caascad-zones failed!" && return 1; }
 }
 
 zone_exists() {
     zone=$1
+    [ -f "${CAASCAD_ZONES_FILE}" ] || return 1
     jq -e ".[\"${zone}\"]?" < "${CAASCAD_ZONES_FILE}" >/dev/null
 }
 
@@ -361,12 +419,12 @@ jsonOutput=0
 localPort=30000
 socketPath="/dev/shm/kswitch"
 [ ! -d /dev/shm ] && socketPath="/tmp/kswitch"
-{ [ -d /dev/shm ] && lockPath="/dev/shm"; } || lockPath="/tmp"
-lockPath="${lockPath}/kswitch.d"
 zone=""
 execCredentialMode=0
 forceRefresh=0
 disableInput=0
+cleanCache=0
+forceUnlock=0
 
 while (( "$#" )); do
     case "$1" in
@@ -394,9 +452,12 @@ while (( "$#" )); do
         forceRefresh=1
         shift
         ;;
+        --clean-cache)
+          cleanCache=1
+        shift
+        ;;
         --force-unlock)
-          force_unlock
-          exit 0
+          forceUnlock=1
         shift
         ;;
         -c)
@@ -420,6 +481,12 @@ while (( "$#" )); do
     esac
 done
 
+
+exitNow=0
+[ "${cleanCache}" -eq 1 ] && clean_cache && exitNow=1
+[ "${forceUnlock}" -eq 1 ] && force_unlock && exitNow=1
+[ "${exitNow}" -eq 1 ] && exit 0
+
 # Makes sure to use ~/.kube/config
 unset KUBECONFIG
 
@@ -427,7 +494,7 @@ unset KUBECONFIG
 
 setup
 check_cache_timeout
-refresh_zones_or_cache
+refresh_zones_or_cache_wrapper
 
 if zone_exists "${zone}"; then
     log_debug "Found caascad zone ${zone}"
@@ -445,13 +512,15 @@ if zone_exists "${zone}"; then
 
     VAULT_ADDR="https://vault.${infraZone}.${domainName}"
     export VAULT_ADDR
+    export VAULT_CLIENT_TIMEOUT
 
-    [ $execCredentialMode -eq 1 ] && get_credentials_or_cache && exit 0
+    [ $execCredentialMode -eq 1 ] && { get_credentials_or_cache_wrapper; exit 0; }
 
     kill_tunnel
     configure_kubeconfig
     start_tunnel
 else
+    [ $execCredentialMode -eq 1 ] && log "No caascad zone ${zone} found" && exit 1
     log "No caascad zone ${zone} found. Trying to switch context anyway..."
 fi
 

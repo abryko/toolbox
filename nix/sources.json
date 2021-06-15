@@ -25,6 +25,19 @@
         "url_template": "https://github.com/<owner>/<repo>/archive/v<version>.tar.gz",
         "version": "0.4.0"
     },
+    "flock": {
+        "branch": "master",
+        "description": "flock(1) locks files",
+        "homepage": null,
+        "owner": "discoteq",
+        "repo": "flock",
+        "rev": "40bdc9b158e1afc3f4b8b291eb191d061305d400",
+        "sha256": "1knyw2cnpwgcxbax4bf015f9qingpsnydp6y6qx0p8kdwj85qakh",
+        "type": "tarball",
+        "url": "https://github.com/discoteq/flock/archive/refs/tags/v0.4.0.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/refs/tags/v<version>.tar.gz",
+        "version": "0.4.0"
+    },
     "fly-wrapper": {
         "branch": "master",
         "description": null,
